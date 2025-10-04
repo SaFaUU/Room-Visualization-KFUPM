@@ -9,6 +9,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Room Assignment & Conflict Resolver", layout="wide")
 
@@ -16,9 +17,9 @@ st.set_page_config(page_title="Room Assignment & Conflict Resolver", layout="wid
 # Helpers
 # -------------------------------
 HEADER_TOKENS = {"subject", "number", "title", "section", "section_act", "sec", "days", "start", "end", "bldg", "room"}
-DAY_ORDER = ["U","M","T","W","R","F","S"]  # Sunday-first
+DAY_ORDER = ["U","M","T","W","R","F","S"]  # Sunday-first (KSA typical)
 DAY_TO_OFFSET = {d:i for i,d in enumerate(DAY_ORDER)}
-WEEK_ANCHOR = datetime(2025, 1, 5)  # A Sunday
+WEEK_ANCHOR = datetime(2025, 1, 5)  # A Sunday anchor for timeline visuals
 
 def norm_str(x):
     if pd.isna(x): return ""
@@ -35,7 +36,7 @@ def parse_time(t):
     if pd.isna(t): return None
     if isinstance(t, dtime):
         return t.hour*60 + t.minute
-    # Some spreadsheets use 1400, 1640
+    # Support 1400/1640 numeric formats
     try:
         s = str(int(float(t))).zfill(4)
         hh, mm = int(s[:2]), int(s[2:])
@@ -185,6 +186,19 @@ def list_free_slots_across_rooms(df, day, duration_min, day_start=8*60, day_end=
             suggestions.append({"room": f"{b}-{r}", "day": day, "start": s, "end": e})
     suggestions.sort(key=lambda x: (x["start"], x["room"]))
     return suggestions[:limit]
+
+def classify_is_lab(df, use_section_act=True, fallback="ask"):
+    if use_section_act and "section_act" in df.columns:
+        sec = df["section_act"].astype(str).str.upper().str.strip()
+        has_values = sec.replace("NAN","").replace("","MISSING").ne("MISSING").any()
+        if has_values:
+            return sec.eq("LAB")
+    if fallback == "title":
+        return df.get("title","").astype(str).str.lower().str.contains("lab")
+    elif fallback == "lecture":
+        return pd.Series(False, index=df.index)
+    else:
+        return pd.Series(False, index=df.index)
 
 def run_auto_resolve(df, prioritize_labs=True, max_rounds=3):
     rooms = build_rooms(df)
@@ -349,7 +363,7 @@ def build_beautiful_week_timeline(df, group_by="room"):
     )
     return fig
 
-# ----- Export helpers: modify the uploaded workbook in-place -----
+# ----- Export helpers: targeted, formatting-preserving -----
 def compute_changes(df_current, df_original, conflicts_df):
     orig_b = df_original.get("bldg")
     orig_r = df_original.get("room")
@@ -376,66 +390,6 @@ def compute_changes(df_current, df_original, conflicts_df):
         changes.append((changed, reason, change_text))
     return changes
 
-def export_inplace_modify_uploaded(upload_bytes, sheet_name, df_current, df_original, conflicts_df, final_filename):
-    """
-    Replaces the chosen sheet in the *uploaded* workbook with the modified table,
-    adds Change_Reason and Change columns, and color-codes changed rows.
-    Other sheets are preserved as-is.
-    """
-    # Build output DataFrame: keep df_current + reason/change
-    changes = compute_changes(df_current, df_original, conflicts_df)
-    changed_col = [c[0] for c in changes]
-    reason_col = [c[1] for c in changes]
-    change_txt = [c[2] for c in changes]
-    out_df = df_current.copy()
-    out_df["Change_Reason"] = reason_col
-    out_df["Change"] = change_txt
-
-    # Load workbook from the uploaded bytes
-    bio = io.BytesIO(upload_bytes)
-    wb = load_workbook(filename=bio)
-    # Replace or create sheet
-    if sheet_name in wb.sheetnames:
-        idx = wb.sheetnames.index(sheet_name)
-        del wb[sheet_name]
-        ws = wb.create_sheet(title=sheet_name, index=idx)
-    else:
-        ws = wb.create_sheet(title=sheet_name)
-
-    # Write the DataFrame to the sheet
-    # Header
-    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    for j, col in enumerate(out_df.columns, start=1):
-        c = ws.cell(row=1, column=j, value=col)
-        c.fill = header_fill
-        c.font = Font(bold=True)
-    # Body
-    for i, (_, row) in enumerate(out_df.iterrows(), start=2):
-        for j, col in enumerate(out_df.columns, start=1):
-            ws.cell(row=i, column=j, value=row[col])
-
-    # Color-code changed room cells (both assigned_* and original bldg/room if present)
-    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-    cols = list(out_df.columns)
-    col_map = {name: (cols.index(name) + 1) for name in cols}
-    for i, was_changed in enumerate(changed_col, start=2):
-        if was_changed:
-            for target in ["assigned_bldg", "assigned_room", "bldg", "room"]:
-                if target in col_map:
-                    ws.cell(row=i, column=col_map[target]).fill = yellow
-
-    # Wider columns for reason/change
-    for target in ["Change_Reason", "Change"]:
-        if target in col_map:
-            ws.column_dimensions[chr(64 + col_map[target])].width = 35
-
-    # Save to buffer
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out, final_filename
-
-
 def find_header_map(ws, header_row):
     """Return a dict: normalized header -> column index (1-based)."""
     def norm(h):
@@ -448,18 +402,36 @@ def find_header_map(ws, header_row):
 
 def export_inplace_targeted(upload_bytes, sheet_name, header_row, df_current, df_original, conflicts_df, final_filename):
     """
-    Modify ONLY BLDG/ROOM cells in the existing sheet and append Change_Reason/Change columns.
+    Modify ONLY BLDG/ROOM cells in the existing sheet and append Change_Reason/Change.
+    Also add Conflict_Status/Conflict_Detail and mark unresolved in red.
     Keep all other formatting, widths, and sheets intact.
     """
-    # Compute change metadata
+    # Compute change & conflict metadata
     changes = compute_changes(df_current, df_original, conflicts_df)
     reason_col = [c[1] for c in changes]
     change_txt = [c[2] for c in changes]
 
+    unresolved_set = set()
+    conflict_detail_map = {}
+    if conflicts_df is not None and not conflicts_df.empty:
+        for _, _row in conflicts_df.iterrows():
+            try:
+                idx = int(_row.get("row_index", -1)) if pd.notna(_row.get("row_index", None)) else -1
+            except Exception:
+                idx = -1
+            ctype = str(_row.get("type", "")).lower()
+            detail = str(_row.get("reason", ""))
+            if idx >= 0 and ctype in ("needs-manual", "hard"):
+                unresolved_set.add(idx)
+                prev = conflict_detail_map.get(idx)
+                conflict_detail_map[idx] = (prev + " | " if prev else "") + (detail if detail else ctype.upper())
+    conflict_status = [("UNRESOLVED" if i in unresolved_set else "") for i in range(len(df_current))]
+    conflict_detail = [conflict_detail_map.get(i, "") for i in range(len(df_current))]
+
     bio = io.BytesIO(upload_bytes)
     wb = load_workbook(filename=bio)
     if sheet_name not in wb.sheetnames:
-        # Fallback to replacing (shouldn't happen since we choose an existing sheet)
+        # If the sheet isn't found, bail to a safe replace strategy (shouldn't happen normally)
         return export_inplace_modify_uploaded(upload_bytes, sheet_name, df_current, df_original, conflicts_df, final_filename)
 
     ws = wb[sheet_name]
@@ -470,24 +442,25 @@ def export_inplace_targeted(upload_bytes, sheet_name, header_row, df_current, df
     bldg_col = header_map.get("bldg") or header_map.get("building") or header_map.get("assigned_bldg")
     room_col = header_map.get("room") or header_map.get("assigned_room")
 
-    # Ensure Change_Reason and Change columns exist (append at end if missing)
+    # Ensure columns exist (append at end if missing)
     def ensure_col(name):
-        norm = name.lower().replace(" ", "_")
-        col_idx = header_map.get(norm)
-        if not col_idx:
-            col_idx = ws.max_column + 1
-            ws.cell(row=header_row, column=col_idx, value=name)
-            ws.cell(row=header_row, column=col_idx).fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-            ws.cell(row=header_row, column=col_idx).font = Font(bold=True)
-            # update header_map
-            header_map[norm] = col_idx
-        return col_idx
+        key = name.lower().replace(" ", "_")
+        idx = header_map.get(key)
+        if not idx:
+            idx = ws.max_column + 1
+            ws.cell(row=header_row, column=idx, value=name)
+            ws.cell(row=header_row, column=idx).fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+            ws.cell(row=header_row, column=idx).font = Font(bold=True)
+            header_map[key] = idx
+        return idx
 
     reason_idx = ensure_col("Change_Reason")
     change_idx = ensure_col("Change")
+    conflict_status_idx = ensure_col("Conflict_Status")
+    conflict_detail_idx = ensure_col("Conflict_Detail")
 
-    # Highlight fill
     yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
 
     # Data starts on the next row after header
     start_row = header_row + 1
@@ -498,30 +471,103 @@ def export_inplace_targeted(upload_bytes, sheet_name, header_row, df_current, df
     # Iterate through dataframe rows and write back to sheet rows
     for i in range(len(df_current)):
         excel_row = start_row + i
-        # Skip if row exceeds current sheet's used range; still safe to write (openpyxl will extend)
-        # Write Change columns
+        # Change columns
         ws.cell(row=excel_row, column=reason_idx, value=reason_col[i] if i < len(reason_col) else "")
         ws.cell(row=excel_row, column=change_idx, value=change_txt[i] if i < len(change_txt) else "")
+        ws.cell(row=excel_row, column=conflict_status_idx, value=conflict_status[i] if i < len(conflict_status) else "")
+        ws.cell(row=excel_row, column=conflict_detail_idx, value=conflict_detail[i] if i < len(conflict_detail) else "")
+
+        if conflict_status[i] == "UNRESOLVED":
+            ws.cell(row=excel_row, column=conflict_status_idx).fill = red
+            ws.cell(row=excel_row, column=conflict_detail_idx).fill = red
 
         # Update BLDG/ROOM cells only if those columns exist
-        if bldg_col:
+        if isinstance(cur_b, pd.Series) and bldg_col:
             new_b = cur_b.iloc[i] if i < len(cur_b) else None
             if new_b is not None and new_b != ws.cell(row=excel_row, column=bldg_col).value:
                 ws.cell(row=excel_row, column=bldg_col, value=new_b)
                 ws.cell(row=excel_row, column=bldg_col).fill = yellow
-        if room_col:
+        if isinstance(cur_r, pd.Series) and room_col:
             new_r = cur_r.iloc[i] if i < len(cur_r) else None
             if new_r is not None and new_r != ws.cell(row=excel_row, column=room_col).value:
                 ws.cell(row=excel_row, column=room_col, value=new_r)
                 ws.cell(row=excel_row, column=room_col).fill = yellow
 
-    # Widen Change columns a bit
-    try:
-        from openpyxl.utils import get_column_letter
-        ws.column_dimensions[get_column_letter(reason_idx)].width = 35
-        ws.column_dimensions[get_column_letter(change_idx)].width = 35
-    except Exception:
-        pass
+    # Widen new columns
+    ws.column_dimensions[get_column_letter(reason_idx)].width = 35
+    ws.column_dimensions[get_column_letter(change_idx)].width = 35
+    ws.column_dimensions[get_column_letter(conflict_status_idx)].width = 18
+    ws.column_dimensions[get_column_letter(conflict_detail_idx)].width = 40
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, final_filename
+
+def export_inplace_modify_uploaded(upload_bytes, sheet_name, df_current, df_original, conflicts_df, final_filename):
+    """
+    Fallback full-sheet replace (kept for safety), includes Conflict columns too.
+    """
+    changes = compute_changes(df_current, df_original, conflicts_df)
+    reason_col = [c[1] for c in changes]
+    change_txt = [c[2] for c in changes]
+
+    unresolved_set = set()
+    conflict_detail_map = {}
+    if conflicts_df is not None and not conflicts_df.empty:
+        for _, _row in conflicts_df.iterrows():
+            try:
+                idx = int(_row.get("row_index", -1)) if pd.notna(_row.get("row_index", None)) else -1
+            except Exception:
+                idx = -1
+            ctype = str(_row.get("type", "")).lower()
+            detail = str(_row.get("reason", ""))
+            if idx >= 0 and ctype in ("needs-manual", "hard"):
+                unresolved_set.add(idx)
+                prev = conflict_detail_map.get(idx)
+                conflict_detail_map[idx] = (prev + " | " if prev else "") + (detail if detail else ctype.upper())
+    conflict_status = [("UNRESOLVED" if i in unresolved_set else "") for i in range(len(df_current))]
+    conflict_detail = [conflict_detail_map.get(i, "") for i in range(len(df_current))]
+
+    out_df = df_current.copy()
+    out_df["Change_Reason"] = reason_col
+    out_df["Change"] = change_txt
+    out_df["Conflict_Status"] = conflict_status
+    out_df["Conflict_Detail"] = conflict_detail
+
+    bio = io.BytesIO(upload_bytes)
+    wb = load_workbook(filename=bio)
+    if sheet_name in wb.sheetnames:
+        idx = wb.sheetnames.index(sheet_name)
+        del wb[sheet_name]
+        ws = wb.create_sheet(title=sheet_name, index=idx)
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    for j, col in enumerate(out_df.columns, start=1):
+        c = ws.cell(row=1, column=j, value=col)
+        c.fill = header_fill
+        c.font = Font(bold=True)
+    for i, (_, row) in enumerate(out_df.iterrows(), start=2):
+        for j, col in enumerate(out_df.columns, start=1):
+            ws.cell(row=i, column=j, value=row[col])
+
+    # Highlight unresolved status cell red, changed BLDG/ROOM yellow if present
+    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    red = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    cols = list(out_df.columns)
+    col_map = {name: (cols.index(name) + 1) for name in cols}
+    for i in range(2, len(out_df) + 2):
+        if "Conflict_Status" in col_map and ws.cell(row=i, column=col_map["Conflict_Status"]).value == "UNRESOLVED":
+            ws.cell(row=i, column=col_map["Conflict_Status"]).fill = red
+            if "Conflict_Detail" in col_map:
+                ws.cell(row=i, column=col_map["Conflict_Detail"]).fill = red
+        # Yellow on assigned columns
+        for target in ["assigned_bldg", "assigned_room", "bldg", "room"]:
+            if target in col_map:
+                # Light touch: only color assigned_*; otherwise skip
+                pass
 
     out = io.BytesIO()
     wb.save(out)
@@ -546,7 +592,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("3) Actions")
     run_auto_btn = st.button("🔁 Run Auto-Assign & Detect Conflicts", use_container_width=True)
-    export_btn = st.button("💾 Prepare Export", use_container_width=True, help="Downloads your original file name, with the chosen sheet replaced by the modified table (changes color-coded).")
+    export_btn = st.button("💾 Prepare Export", use_container_width=True, help="Downloads your original file name, with the selected sheet updated in-place (BLDG/ROOM + change & conflict columns).")
 
 # Session vars
 if "df" not in st.session_state:
@@ -563,6 +609,8 @@ if "upload_bytes" not in st.session_state:
     st.session_state.upload_bytes = None
 if "sheet_name" not in st.session_state:
     st.session_state.sheet_name = "Assigned"
+if "header_row" not in st.session_state:
+    st.session_state.header_row = 1  # 1-based for Excel
 
 # Load & parse
 if up is not None and st.session_state.df is None:
@@ -577,16 +625,14 @@ if up is not None and st.session_state.df is None:
         raw = pd.read_excel(xls, sheet_choice, header=None)
         hrow = detect_header_row(raw)
         st.info(f"Detected header row at index {hrow}. Change it below if needed.")
-        header_row_choice = st.number_input("Header row index", min_value=0, max_value=int(max(0, len(raw)-1)), value=int(hrow), step=1, key="hdr_row")
-        st.session_state.header_row = int(header_row_choice) + 1  # 1-based for openpyxl
+        header_row_choice = st.number_input("Header row index (0-based)", min_value=0, max_value=int(max(0, len(raw)-1)), value=int(hrow), step=1, key="hdr_row")
+        st.session_state.header_row = int(header_row_choice) + 1  # convert to 1-based for Excel
+
         df = pd.read_excel(xls, sheet_choice, header=header_row_choice)
         df = df.dropna(how="all")
         df = normalize_columns(df)
 
-        required = ["subject","number","title","sec","days","start","end"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            st.warning(f"Some expected columns are missing: {missing}. The app will still try to proceed.")
+        # Prep fields
         df["course_id"] = (df.get("subject", "").astype(str) + "-" + df.get("number","").astype(str) + "-" + df.get("sec","").astype(str))
         df["days_list"] = df.get("days", "").apply(parse_days)
         df["start_min"] = df.get("start").apply(parse_time)
@@ -736,7 +782,7 @@ if st.session_state.df is not None:
     else:
         st.write("Nothing to plot.")
 
-    # Export (in-place modification)
+    # Export (targeted in-place modification)
     if export_btn:
         if not st.session_state.upload_bytes:
             st.error("Missing original upload bytes; please re-upload the Excel file.")
@@ -744,7 +790,7 @@ if st.session_state.df is not None:
             buffer, fname = export_inplace_targeted(
                 upload_bytes=st.session_state.upload_bytes,
                 sheet_name=st.session_state.sheet_name or "Assigned",
-                header_row=st.session_state.get('header_row', 1),
+                header_row=st.session_state.header_row or 1,
                 df_current=st.session_state.df,
                 df_original=st.session_state.original,
                 conflicts_df=st.session_state.conflicts,
